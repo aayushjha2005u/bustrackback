@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bus_tracking
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    restart: always
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  backend:
+    build: .
+    restart: always
+    depends_on:
+      - db
+      - mqtt
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/bus_tracking
+      MQTT_BROKER: mqtt
+      MQTT_PORT: 1883
+      SECRET_KEY: change-this-to-a-random-secret-key-in-production
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
