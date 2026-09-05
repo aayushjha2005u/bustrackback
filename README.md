@@ -1,145 +1,137 @@
-# Bus Tracking System - Backend (FastAPI)
+# Bus Tracking System — Backend (FastAPI)
 
-A GPS-based vehicle tracking backend built with FastAPI, PostgreSQL,
-and MQTT. Each user logs in and can only ever see the bus route and
-vehicle assigned to them.
+A GPS-based vehicle tracking backend built with FastAPI, PostgreSQL, and MQTT.
+Each user is assigned exactly one route and one vehicle, and can only ever
+access data for their own assignment — enforced at the backend/JWT level,
+not just hidden in the UI.
 
 ## Architecture
+Client (Flutter app)
+│ POST /auth/login
+▼
+FastAPI (JWT auth) ──► PostgreSQL (users, routes, vehicles, gps_logs)
+▲
+│ reads
+Vehicle GPS data ──► MQTT broker ──► MQTT listener ──┐
+├──► gps_logs table
+Vehicle GPS data ──► REST /gps/ingest ────────────────┘
 
-```
-Vehicle / GPS Simulator
-        |
-        |  MQTT (preferred) or REST POST /gps/ingest
-        v
-   FastAPI Backend  ---->  PostgreSQL (users, routes, vehicles, gps_logs)
-        ^
-        |  REST API (JWT-authenticated)
-        |
-   Flutter Mobile App
-```
 
-- **FastAPI** exposes REST endpoints for login and for each user's
-  assigned route / vehicle / location data.
-- **MQTT (Mosquitto)** is the primary channel for vehicles to report
-  GPS coordinates. A background listener (`app/core/mqtt_listener.py`)
-  subscribes to `vehicles/+/gps` and writes every message straight
-  into the database.
-- **REST `/gps/ingest`** is kept as a fallback ingestion method (the
-  task explicitly allows "MQTT, REST, or another suitable approach").
-  The GPS simulator uses MQTT by default.
-- **PostgreSQL** stores everything: users, routes, vehicles, and the
-  full GPS history (every ping, not just the latest).
+- **FastAPI** serves REST APIs and auto-generates docs at `/docs`.
+- **PostgreSQL** stores all persistent data via SQLAlchemy ORM.
+- **MQTT** is the preferred GPS ingestion path (`app/core/mqtt_listener.py`
+  subscribes to `vehicles/+/gps` and writes to the same `gps_logs` table).
+- **REST `/gps/ingest`** is kept as the fallback ingestion method the task
+  explicitly allows, and is what a simple GPS simulator script would use.
 
-## Database design
+## Database Design
 
-| Table      | Purpose                                                   |
-|------------|------------------------------------------------------------|
-| `users`    | Login credentials + `assigned_route_id` + `assigned_vehicle_id` |
-| `routes`   | Named bus routes (e.g. "Route A")                          |
-| `vehicles` | Physical vehicles, each linked to one route                |
-| `gps_logs` | Every GPS ping ever received, linked to a vehicle          |
+| Table    | Purpose                                                                 |
+|----------|--------------------------------------------------------------------------|
+| `users`      | Login credentials + `assigned_route_id` + `assigned_vehicle_id` (each user maps to exactly one route and one vehicle) |
+| `routes`     | Named routes (e.g. "Route A", "Downtown -> Airport")                 |
+| `vehicles`   | Vehicles (e.g. "BUS-001"), each linked to one route                  |
+| `gps_logs`   | Every GPS ping ever received for a vehicle — never overwritten, so this table doubles as both live location and full history |
 
-Each user has exactly one assigned route and one assigned vehicle
-(foreign keys on the `users` table). "Latest location" is simply the
-most recent row in `gps_logs` for that vehicle; "historical data" is
-every row, so nothing is ever overwritten.
+"Latest location" = most recent row in `gps_logs` for a vehicle.
+"Historical data" = all rows in `gps_logs` for a vehicle.
 
-## Authentication & authorization (the core business logic)
+## Authentication & Authorization
 
-1. `POST /auth/login` checks username/password and returns a JWT.
-2. Every other protected endpoint requires `Authorization: Bearer <token>`.
-3. `app/core/deps.py` decodes the token and loads the **real** user
-   record from the database on every request.
-4. Every tracking endpoint (`/tracking/my-route`, `/tracking/my-vehicle`,
-   `/tracking/my-location`, `/tracking/my-history`, `/tracking/my-summary`)
-   reads `current_user.assigned_route_id` / `assigned_vehicle_id` -
-   **never** an ID passed in by the client.
+- Login (`POST /auth/login`) verifies a hashed password and issues a JWT.
+- Every protected endpoint uses `Depends(get_current_user)`, which decodes
+  the JWT and loads the user from the DB.
+- **Critically: no endpoint accepts a `user_id` or `vehicle_id` from the
+  client.** Every "my-*" endpoint only ever looks at
+  `current_user.assigned_route_id` / `assigned_vehicle_id` — values that
+  came from the verified token, not from anything a client could fake in
+  a URL or request body. This means User A can never retrieve User B's
+  route or vehicle, even by calling the API directly (e.g. via Postman).
 
-This means the restriction is enforced by the backend itself: even if
-someone calls the API directly with a tool like Postman, they can
-never fetch another user's route or vehicle, because the endpoints
-never accept "which user" as an input - they only ever use whoever
-the token says you are.
+## API Endpoints
 
-## API endpoints
+| Method | Endpoint                  | Auth required | Description |
+|--------|----------------------------|:---:|-------------|
+| POST   | `/auth/login`               | ❌ | Returns a JWT access token |
+| GET    | `/tracking/my-route`        | ✅ | Logged-in user's assigned route |
+| GET    | `/tracking/my-vehicle`      | ✅ | Logged-in user's assigned vehicle |
+| GET    | `/tracking/my-location`     | ✅ | Latest GPS ping for the user's vehicle |
+| GET    | `/tracking/my-history?limit=50` | ✅ | Historical GPS pings for the user's vehicle |
+| GET    | `/tracking/my-summary`      | ✅ | Route + vehicle + latest location in one call (used by the Flutter home screen) |
+| POST   | `/gps/ingest`                | ❌ | Vehicle reports a GPS ping (REST fallback to MQTT) |
+| POST   | `/admin/routes`              | ❌ | Create a route (setup/testing helper) |
+| POST   | `/admin/vehicles`            | ❌ | Create a vehicle (setup/testing helper) |
+| POST   | `/admin/users`               | ❌ | Create a user with route/vehicle assignment (setup/testing helper) |
 
-| Method | Endpoint                  | Auth required | Description                              |
-|--------|----------------------------|:--:|-------------------------------------------|
-| POST   | `/auth/login`              | No | Returns a JWT access token                |
-| GET    | `/tracking/my-route`       | Yes | The logged-in user's assigned route       |
-| GET    | `/tracking/my-vehicle`     | Yes | The logged-in user's assigned vehicle     |
-| GET    | `/tracking/my-location`    | Yes | Latest GPS position of the assigned vehicle |
-| GET    | `/tracking/my-history`     | Yes | Historical GPS pings (default last 50)    |
-| GET    | `/tracking/my-summary`     | Yes | Route + vehicle + latest location in one call (used by the Flutter Home screen) |
-| POST   | `/gps/ingest`               | No* | Vehicle reports a new GPS position (REST fallback) |
-| POST   | `/admin/routes`             | No* | Create a route (setup/testing)            |
-| POST   | `/admin/vehicles`           | No* | Create a vehicle (setup/testing)          |
-| POST   | `/admin/users`              | No* | Create a user with route/vehicle assignment (setup/testing) |
+> The `/gps/ingest` and `/admin/*` endpoints are intentionally not behind
+> user login — a vehicle device or an admin setting up test data isn't a
+> logged-in "user" in this system. In production these would sit behind
+> a per-vehicle API key and an admin role check respectively; that's a
+> known simplification for this assessment's scope.
 
-\* Not user-auth protected because these are called by devices/admins,
-not by app users. In a production system these would use a separate
-API key or admin role - noted here as a known simplification for the
-scope of this assessment.
+Full interactive docs (try every endpoint from the browser) at:
+`http://localhost:8000/docs`
 
-Interactive docs (Swagger UI) are auto-generated at `/docs` once the
-server is running.
+## GPS Data Flow
 
-## GPS data flow
+1. A vehicle publishes `{latitude, longitude, speed}` either to the MQTT
+   topic `vehicles/<vehicle_code>/gps` or to `POST /gps/ingest`.
+2. The backend resolves the vehicle by `vehicle_code` and inserts a new
+   row into `gps_logs` — old rows are never deleted or overwritten.
+3. When a user requests `/tracking/my-location` or `/tracking/my-summary`,
+   the backend queries the most recent `gps_logs` row for that user's
+   `assigned_vehicle_id`.
+4. `/tracking/my-history` returns the full (or `limit`-ed) list of past
+   pings for the same vehicle, ordered newest-first.
 
-```
-GPS Simulator --publishes--> MQTT topic "vehicles/BUS-001/gps"
-                                      |
-                     MQTT listener (background thread in FastAPI)
-                                      |
-                              gps_logs table (Postgres)
-                                      |
-                    Flutter app polls /tracking/my-summary
-                                      |
-                         Map screen shows current position
-```
+## Route / Vehicle Assignment Logic
 
-## Setup - local (without Docker)
+- Each `User` row has one `assigned_route_id` and one `assigned_vehicle_id`.
+- Assignment happens once, either via `seed_data.py` (for the two demo
+  users) or via `POST /admin/users`.
+- Example: User A → Route A → BUS-001. If User A logs in, every
+  `/tracking/*` call resolves data through their own `assigned_vehicle_id`
+  only — they cannot see BUS-002's data no matter what they send in the
+  request.
 
-1. Install PostgreSQL and create a database named `bus_tracking`.
-2. Install an MQTT broker locally (e.g. Mosquitto) OR skip MQTT and
-   just use the REST `/gps/ingest` endpoint for testing.
-3. Copy `.env.example` to `.env` and adjust values if needed.
-4. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-5. Run the server:
-   ```
-   uvicorn app.main:app --reload
-   ```
-6. Populate sample data:
-   ```
-   python seed_data.py
-   ```
-   This creates two test users:
-   - `usera` / `pass123` -> Route A / BUS-001
-   - `userb` / `pass123` -> Route B / BUS-002
-7. (Optional) Run the GPS simulator to see live data:
-   ```
-   python gps_simulator.py
-   ```
-8. Open `http://localhost:8000/docs` to try every endpoint.
+## Setup
 
-## Setup - with Docker (bonus)
+**Prerequisites:** Python 3.11+, PostgreSQL running locally, (optional) an
+MQTT broker such as Mosquitto for the MQTT ingestion path.
 
-```
-docker-compose up --build
+```bash
+# 1. Clone and enter the project
+git clone https://github.com/aayushjha2005u/bustrackback.git
+cd bustrackback
+
+# 2. Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Configure environment
+cp .env.example .env
+# edit .env with your own DATABASE_URL, SECRET_KEY, MQTT_BROKER, etc.
+
+# 5. Seed demo users (Route A/BUS-001 and Route B/BUS-002)
+python seed_data.py
+
+# 6. Run the server
+uvicorn app.main:app --reload
 ```
 
-This starts PostgreSQL, the Mosquitto MQTT broker, and the FastAPI
-backend together. Then run `python seed_data.py` and
-`python gps_simulator.py` from your host machine (pointed at
-`localhost`) to populate and simulate data.
+API docs: http://localhost:8000/docs
 
-## Testing the core business rule manually
+**Demo credentials** (from `seed_data.py`):
 
-1. Log in as `usera`, call `/tracking/my-summary` -> see Route A / BUS-001.
-2. Log in as `userb`, call `/tracking/my-summary` -> see Route B / BUS-002.
-3. Confirm neither user can ever retrieve the other's data, regardless
-   of what's sent in the request - because the endpoints only trust
-   the identity embedded in the JWT token.
+| Username | Password | Route | Vehicle |
+|----------|----------|-------|---------|
+| usera    | pass123  | Route A | BUS-001 |
+| userb    | pass123  | Route B | BUS-002 |
+
+## Tech Stack
+
+FastAPI · SQLAlchemy · PostgreSQL · Pydantic · JWT (python-jose) · paho-mqtt · Uvicorn
+Eof
